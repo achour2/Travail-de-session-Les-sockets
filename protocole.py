@@ -1,4 +1,5 @@
 import struct
+import zlib
 
 HEADER_FMT = "!BBIIHI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
@@ -14,14 +15,37 @@ MSG_LS = 6
 MSG_LS_RESP = 7
 
 
+def compute_checksum(payload):
+    return zlib.crc32(payload) & 0xFFFFFFFF
+
+
 def make_header(ver, typ, seq, ack, payload_len, checksum):
     return struct.pack(HEADER_FMT, ver, typ, seq, ack, payload_len, checksum)
+
+
+def build_packet(ver, typ, seq, ack, payload=b""):
+    checksum = compute_checksum(payload)
+    return make_header(ver, typ, seq, ack, len(payload), checksum) + payload
 
 
 def parse_header(data):
     if len(data) < HEADER_SIZE:
         raise ValueError("Message trop court pour contenir un en-tete")
     return struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+
+
+def parse_packet(data):
+    ver, typ, seq, ack, payload_len, checksum = parse_header(data)
+    total_len = HEADER_SIZE + payload_len
+    if len(data) < total_len:
+        raise ValueError("Message incomplet")
+    payload = data[HEADER_SIZE:total_len]
+    expected_checksum = compute_checksum(payload)
+    if checksum != expected_checksum:
+        raise ValueError(
+            f"Checksum invalide: recu={checksum} attendu={expected_checksum}"
+        )
+    return ver, typ, seq, ack, payload_len, checksum, payload
 
 
 def is_supported_version(ver):

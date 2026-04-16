@@ -23,8 +23,8 @@ def load_config():
 
 
 def make_ack(seq):
-    return protocole.make_header(
-        protocole.PROTOCOL_VERSION, protocole.MSG_ACK, 0, seq, 0, 0
+    return protocole.build_packet(
+        protocole.PROTOCOL_VERSION, protocole.MSG_ACK, 0, seq
     )
 
 
@@ -50,6 +50,7 @@ def start_upload_session(addr, seq, payload, sessions):
     if not filename or Path(filename).name != filename:
         return None, "Nom de fichier invalide"
 
+    close_session(sessions, addr)
     UPLOAD_DIR.mkdir(exist_ok=True)
     destination = UPLOAD_DIR / filename
     file_obj = destination.open("wb")
@@ -70,6 +71,7 @@ def append_upload_session(addr, seq, payload, sessions):
     if len(payload) == 0:
         session["file"].close()
         path = session["path"]
+        session["expected_seq"] = seq + 1
         session["completed_seq"] = seq
         session["completed"] = True
         return f"Fichier recu: {path.name}"
@@ -106,21 +108,19 @@ def main():
     while True:
         data, addr = sock.recvfrom(65535)
         try:
-            ver, typ, seq, ack, payload_len, checksum = protocole.parse_header(data)
-        except ValueError:
-            print(f"Paquet ignore de {addr}: message trop court", flush=True)
+            ver, typ, seq, ack, payload_len, checksum, payload = protocole.parse_packet(data)
+        except ValueError as exc:
+            print(f"Paquet ignore de {addr}: {exc}", flush=True)
             continue
 
         if not protocole.is_supported_version(ver):
             print(f"Paquet ignore de {addr}: version {ver} non supportee", flush=True)
             continue
 
-        payload = data[protocole.HEADER_SIZE : protocole.HEADER_SIZE + payload_len]
-
         if typ == protocole.MSG_OPEN:
             print(f"[RECV] OPEN de {addr}", flush=True)
-            rep = protocole.make_header(
-                protocole.PROTOCOL_VERSION, protocole.MSG_OPEN_ACK, 0, 0, 0, 0
+            rep = protocole.build_packet(
+                protocole.PROTOCOL_VERSION, protocole.MSG_OPEN_ACK, 0, 0
             )
             print(f"[SEND] OPEN_ACK vers {addr}", flush=True)
             sock.sendto(rep, addr)
@@ -128,14 +128,13 @@ def main():
         elif typ == protocole.MSG_LS:
             print(f"[RECV] LS de {addr}", flush=True)
             listing = list_server_files()
-            rep = protocole.make_header(
+            rep = protocole.build_packet(
                 protocole.PROTOCOL_VERSION,
                 protocole.MSG_LS_RESP,
                 0,
                 0,
-                len(listing),
-                0,
-            ) + listing
+                listing,
+            )
             print(f"[SEND] LS_RESP vers {addr} ({len(listing)} octets)", flush=True)
             sock.sendto(rep, addr)
 
@@ -177,9 +176,6 @@ def main():
                         )
                 print(f"[SEND] ACK {seq} vers {addr}", flush=True)
                 sock.sendto(make_ack(seq), addr)
-                session = upload_sessions.get(addr)
-                if session is not None and session.get("completed"):
-                    close_session(upload_sessions, addr)
             except OSError as exc:
                 print(f"Erreur d'ecriture pour {addr}: {exc}", flush=True)
                 close_session(upload_sessions, addr)

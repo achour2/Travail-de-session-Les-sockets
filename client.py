@@ -27,11 +27,10 @@ def wait_for_message(sock, expected_type, max_reprises):
     for tentative in range(1, max_reprises + 1):
         try:
             data, _ = sock.recvfrom(65535)
-            ver, typ, seq, ack, payload_len, checksum = protocole.parse_header(data)
+            ver, typ, seq, ack, payload_len, checksum, payload = protocole.parse_packet(data)
             if not protocole.is_supported_version(ver):
                 print(f"Version de protocole non supportee: {ver}")
                 return None
-            payload = data[protocole.HEADER_SIZE : protocole.HEADER_SIZE + payload_len]
             if typ != expected_type:
                 print(
                     f"[RECV] type={typ} seq={seq} ack={ack} taille={payload_len} "
@@ -51,26 +50,30 @@ def wait_for_message(sock, expected_type, max_reprises):
 
 
 def wait_for_ack(sock, expected_ack, max_reprises):
-    message = wait_for_message(sock, protocole.MSG_ACK, max_reprises)
-    if message is None:
-        return False
+    while True:
+        message = wait_for_message(sock, protocole.MSG_ACK, max_reprises)
+        if message is None:
+            return False
 
-    _, _, _, ack, _ = message
-    if ack != expected_ack:
-        print(f"ACK inattendu recu: {ack}, attendu: {expected_ack}")
-        return False
-    print(f"[ACK] confirmation recue pour le segment {ack}")
-    return True
+        _, _, _, ack, _ = message
+        if ack < expected_ack:
+            print(f"[ACK] ancien ACK recu pour le segment {ack}, ignore")
+            continue
+        if ack != expected_ack:
+            print(f"ACK inattendu recu: {ack}, attendu: {expected_ack}")
+            return False
+        print(f"[ACK] confirmation recue pour le segment {ack}")
+        return True
 
 
 def open_connection(sock, server_addr, max_reprises):
-    header = protocole.make_header(
-        protocole.PROTOCOL_VERSION, protocole.MSG_OPEN, 0, 0, 0, 0
+    packet = protocole.build_packet(
+        protocole.PROTOCOL_VERSION, protocole.MSG_OPEN, 0, 0
     )
 
     for tentative in range(1, max_reprises + 1):
         print(f"[SEND] OPEN vers {server_addr[0]}:{server_addr[1]} (tentative {tentative})")
-        sock.sendto(header, server_addr)
+        sock.sendto(packet, server_addr)
         message = wait_for_message(sock, protocole.MSG_OPEN_ACK, 1)
         if message is not None:
             print("Connecte au serveur")
@@ -82,11 +85,11 @@ def open_connection(sock, server_addr, max_reprises):
 
 
 def list_remote_files(sock, server_addr, max_reprises):
-    header = protocole.make_header(
-        protocole.PROTOCOL_VERSION, protocole.MSG_LS, 0, 0, 0, 0
+    packet = protocole.build_packet(
+        protocole.PROTOCOL_VERSION, protocole.MSG_LS, 0, 0
     )
     print(f"[SEND] LS vers {server_addr[0]}:{server_addr[1]}")
-    sock.sendto(header, server_addr)
+    sock.sendto(packet, server_addr)
     message = wait_for_message(sock, protocole.MSG_LS_RESP, max_reprises)
     if message is None:
         print("Impossible de recuperer la liste des fichiers")
@@ -144,8 +147,8 @@ def upload_file(sock, server_addr, filepath, mss, max_reprises):
         print("Echec du televersement")
         return
 
-    end_packet = protocole.make_header(
-        protocole.PROTOCOL_VERSION, protocole.MSG_DATA, len(chunks) + 1, 0, 0, 0
+    end_packet = protocole.build_packet(
+        protocole.PROTOCOL_VERSION, protocole.MSG_DATA, len(chunks) + 1, 0
     )
     print(f"[SEND] FIN seq={len(chunks) + 1}")
     if not send_packet_with_retry(sock, end_packet, server_addr, len(chunks) + 1, max_reprises):
@@ -157,9 +160,9 @@ def upload_file(sock, server_addr, filepath, mss, max_reprises):
 
 def send_data_chunks(sock, server_addr, chunks, max_reprises):
     for seq, payload in enumerate(chunks, start=1):
-        packet = protocole.make_header(
-            protocole.PROTOCOL_VERSION, protocole.MSG_DATA, seq, 0, len(payload), 0
-        ) + payload
+        packet = protocole.build_packet(
+            protocole.PROTOCOL_VERSION, protocole.MSG_DATA, seq, 0, payload
+        )
         if not send_packet_with_retry(sock, packet, server_addr, seq, max_reprises):
             return False
     return True
@@ -219,8 +222,8 @@ def main():
 
         elif cmd[0] == "bye":
             if server_addr:
-                header = protocole.make_header(
-                    protocole.PROTOCOL_VERSION, protocole.MSG_BYE, 0, 0, 0, 0
+                header = protocole.build_packet(
+                    protocole.PROTOCOL_VERSION, protocole.MSG_BYE, 0, 0
                 )
                 sock.sendto(header, server_addr)
             print("Fermeture du client")
