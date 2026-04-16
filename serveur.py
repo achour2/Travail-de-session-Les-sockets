@@ -141,6 +141,16 @@ def main():
 
         elif typ == protocole.MSG_DATA:
             try:
+                existing_session = upload_sessions.get(addr)
+                if existing_session is not None and seq < existing_session["expected_seq"]:
+                    print(
+                        f"[RECV] DATA seq={seq} duplique depuis {addr}",
+                        flush=True,
+                    )
+                    print(f"[SEND] ACK {seq} vers {addr}", flush=True)
+                    sock.sendto(make_ack(seq), addr)
+                    continue
+
                 if seq == 1:
                     filename, error = start_upload_session(addr, seq, payload, upload_sessions)
                     if error is not None:
@@ -154,15 +164,6 @@ def main():
                 else:
                     result = append_upload_session(addr, seq, payload, upload_sessions)
                     if result is not None:
-                        if result.startswith("DUPLICATE:"):
-                            duplicate_seq = int(result.split(":", 1)[1])
-                            print(
-                                f"[RECV] DATA seq={duplicate_seq} duplique depuis {addr}",
-                                flush=True,
-                            )
-                            print(f"[SEND] ACK {duplicate_seq} vers {addr}", flush=True)
-                            sock.sendto(make_ack(duplicate_seq), addr)
-                            continue
                         if result.startswith("Fichier recu:"):
                             print(f"[RECV] DATA seq={seq} FIN depuis {addr}", flush=True)
                             print(f"{result} depuis {addr}", flush=True)
