@@ -1,13 +1,16 @@
 from configparser import ConfigParser
+import json
 from pathlib import Path
 from socket import AF_INET, SOCK_DGRAM, timeout
 import struct
+import time
 
 import protocole
 import usocket
 
 PORT = 4242
 CONFIG_PATH = Path(__file__).with_name("config.ini")
+STATE_FILE = Path(__file__).with_name("transfert_state.json")
 
 
 def load_config():
@@ -22,6 +25,32 @@ def load_config():
         "mss": parser.getint("PROTOCOLE", "mss", fallback=1024),
         "window_size": parser.getint("PROTOCOLE", "fenetrage", fallback=1),
     }
+
+
+def save_state(filename, total_size, last_seq_sent, last_ack_recu, bytes_confirmed):
+    state = {
+        "filename": filename,
+        "total_size": total_size,
+        "last_seq_sent": last_seq_sent,
+        "last_ack_recu": last_ack_recu,
+        "bytes_confirmed": bytes_confirmed,
+        "timestamp": time.time(),
+    }
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def clear_state():
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
 
 
 def wait_for_message(sock, expected_type, max_reprises):
@@ -139,6 +168,33 @@ def send_packet_with_retry(sock, packet, server_addr, seq, max_reprises):
     return False
 
 
+def send_chunks_with_state(
+    sock,
+    server_addr,
+    chunks,
+    max_reprises,
+    filename,
+    total_size,
+    bytes_before_start,
+    first_data_prefix_len=0,
+):
+    bytes_confirmed = bytes_before_start
+    for seq, payload in enumerate(chunks, start=1):
+        packet = protocole.build_packet(
+            protocole.PROTOCOL_VERSION, protocole.MSG_DATA, seq, 0, payload
+        )
+        if not send_packet_with_retry(sock, packet, server_addr, seq, max_reprises):
+            return False, bytes_confirmed, seq
+
+        data_bytes = len(payload)
+        if seq == 1 and first_data_prefix_len:
+            data_bytes = max(0, len(payload) - first_data_prefix_len)
+        bytes_confirmed += data_bytes
+        save_state(filename, total_size, seq, seq, bytes_confirmed)
+
+    return True, bytes_confirmed, len(chunks)
+
+
 def upload_file(sock, connection, filepath, max_reprises):
     path = Path(filepath)
     if not path.is_file():
@@ -155,6 +211,20 @@ def upload_file(sock, connection, filepath, max_reprises):
         return
 
     data = path.read_bytes()
+    saved = load_state()
+    if (
+        saved
+        and saved.get("filename") == path.name
+        and saved.get("total_size") == len(data)
+        and saved.get("bytes_confirmed", 0) < len(data)
+    ):
+        print(
+            "Transfert interrompu detecte. "
+            f"Dernier ACK client={saved.get('last_ack_recu', 0)}. Passage en reprise."
+        )
+        resume_file(sock, connection, filepath, max_reprises)
+        return
+
     print(
         f"Preparation du fichier {path.name}: {len(data)} octets "
         f"(mss negocie={mss}, window_size={window_size})"
@@ -171,7 +241,18 @@ def upload_file(sock, connection, filepath, max_reprises):
         chunks.append(data[offset : offset + mss])
         offset += mss
 
-    if not send_data_chunks(sock, server_addr, chunks, max_reprises):
+    save_state(path.name, len(data), 0, 0, 0)
+    sent_ok, _, _ = send_chunks_with_state(
+        sock,
+        server_addr,
+        chunks,
+        max_reprises,
+        path.name,
+        len(data),
+        0,
+        first_data_prefix_len=2 + len(filename_bytes),
+    )
+    if not sent_ok:
         print("Echec du televersement")
         return
 
@@ -183,6 +264,7 @@ def upload_file(sock, connection, filepath, max_reprises):
         print("Echec de finalisation du televersement")
         return
 
+    clear_state()
     print(f"Fichier televerse: {path.name} en {len(chunks)} segment(s) + FIN")
 
 
@@ -230,6 +312,12 @@ def resume_file(sock, connection, filepath, max_reprises):
     server_addr = connection["addr"]
     mss = connection["mss"]
     data = path.read_bytes()
+    saved = load_state()
+    if saved and saved.get("filename") == path.name:
+        print(
+            f"Etat client retrouve: last_seq_sent={saved.get('last_seq_sent', 0)}, "
+            f"last_ack_recu={saved.get('last_ack_recu', 0)}"
+        )
 
     offset = request_resume(sock, connection, path.name, max_reprises)
     if offset is None:
@@ -247,9 +335,22 @@ def resume_file(sock, connection, filepath, max_reprises):
     remaining = data[offset:]
     chunks = [remaining[i : i + mss] for i in range(0, len(remaining), mss)]
 
-    if chunks and not send_data_chunks(sock, server_addr, chunks, max_reprises):
-        print("Echec de la reprise du televersement")
-        return
+    save_state(path.name, len(data), 0, 0, offset)
+    if chunks:
+        sent_ok, bytes_confirmed, _ = send_chunks_with_state(
+            sock,
+            server_addr,
+            chunks,
+            max_reprises,
+            path.name,
+            len(data),
+            offset,
+        )
+        if not sent_ok:
+            print("Echec de la reprise du televersement")
+            return
+    else:
+        bytes_confirmed = offset
 
     end_seq = len(chunks) + 1
     end_packet = protocole.build_packet(
@@ -260,6 +361,8 @@ def resume_file(sock, connection, filepath, max_reprises):
         print("Echec de finalisation de la reprise")
         return
 
+    save_state(path.name, len(data), end_seq, end_seq, bytes_confirmed)
+    clear_state()
     print(f"Reprise terminee pour {path.name}")
 
 
