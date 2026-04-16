@@ -80,6 +80,7 @@ def wait_for_message(sock, expected_type, max_reprises):
 
 
 def wait_for_ack(sock, expected_ack, max_reprises):
+    # Ignore les anciens ACK et ne valide que celui du segment courant.
     while True:
         message = wait_for_message(sock, protocole.MSG_ACK, max_reprises)
         if message is None:
@@ -97,6 +98,7 @@ def wait_for_ack(sock, expected_ack, max_reprises):
 
 
 def open_connection(sock, server_addr, config):
+    # Le handshake OPEN / OPEN_ACK sert aussi a negocier MSS et window_size.
     payload = protocole.build_negotiation_payload(
         config["mss"],
         config["window_size"],
@@ -178,6 +180,7 @@ def send_chunks_with_state(
     bytes_before_start,
     first_data_prefix_len=0,
 ):
+    # Met a jour l'etat client apres chaque ACK pour permettre une reprise.
     bytes_confirmed = bytes_before_start
     for seq, payload in enumerate(chunks, start=1):
         packet = protocole.build_packet(
@@ -218,6 +221,7 @@ def upload_file(sock, connection, filepath, max_reprises):
         and saved.get("total_size") == len(data)
         and saved.get("bytes_confirmed", 0) < len(data)
     ):
+        # Si un etat existe pour ce meme fichier, on bascule directement en reprise.
         print(
             "Transfert interrompu detecte. "
             f"Dernier ACK client={saved.get('last_ack_recu', 0)}. Passage en reprise."
@@ -279,6 +283,7 @@ def send_data_chunks(sock, server_addr, chunks, max_reprises):
 
 
 def request_resume(sock, connection, filename, max_reprises):
+    # Demande au serveur combien d'octets du fichier il considere deja valides.
     server_addr = connection["addr"]
     filename_bytes = filename.encode("utf-8")
     packet = protocole.build_packet(
@@ -332,6 +337,7 @@ def resume_file(sock, connection, filepath, max_reprises):
     print(
         f"Reprise de {path.name}: offset serveur={offset} / taille locale={len(data)}"
     )
+    # La reprise repart a partir de l'offset confirme par le serveur.
     remaining = data[offset:]
     chunks = [remaining[i : i + mss] for i in range(0, len(remaining), mss)]
 

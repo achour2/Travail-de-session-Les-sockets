@@ -41,6 +41,7 @@ def list_server_files():
 
 
 def start_upload_session(addr, seq, payload, sessions, negotiated_mss):
+    # Le premier segment d'un put contient le nom du fichier puis les premieres donnees.
     if len(payload) < 2:
         return None, "Payload initial incomplet"
 
@@ -70,6 +71,7 @@ def start_upload_session(addr, seq, payload, sessions, negotiated_mss):
 
 
 def append_upload_session(addr, seq, payload, sessions, negotiated_mss):
+    # Refuse les trous de sequence et signale les doublons pour pouvoir re-ACKer.
     session = sessions.get(addr)
     if session is None:
         return "Aucune session de televersement active"
@@ -101,6 +103,7 @@ def close_session(sessions, addr):
 
 
 def start_resume_session(addr, filename, sessions):
+    # Ouvre le fichier existant en ajout pour reprendre exactement a la taille deja ecrite.
     if not filename or Path(filename).name != filename:
         return None, "Nom de fichier invalide"
 

@@ -4,7 +4,7 @@
 
 - Nom : Achour Messaoudi
 - Date : Avril 2026
-- Contexte : TP de teleinformatique
+- Contexte : Travail de session – Les sockets : Teleinformatique
 
 ## Objectif
 
