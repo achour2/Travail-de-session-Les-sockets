@@ -62,13 +62,16 @@ def append_upload_session(addr, seq, payload, sessions):
     session = sessions.get(addr)
     if session is None:
         return "Aucune session de televersement active"
+    if seq < session["expected_seq"]:
+        return f"DUPLICATE:{seq}"
     if seq != session["expected_seq"]:
         return f"Numero de sequence inattendu: {seq}"
 
     if len(payload) == 0:
         session["file"].close()
         path = session["path"]
-        del sessions[addr]
+        session["completed_seq"] = seq
+        session["completed"] = True
         return f"Fichier recu: {path.name}"
 
     session["file"].write(payload)
@@ -151,6 +154,15 @@ def main():
                 else:
                     result = append_upload_session(addr, seq, payload, upload_sessions)
                     if result is not None:
+                        if result.startswith("DUPLICATE:"):
+                            duplicate_seq = int(result.split(":", 1)[1])
+                            print(
+                                f"[RECV] DATA seq={duplicate_seq} duplique depuis {addr}",
+                                flush=True,
+                            )
+                            print(f"[SEND] ACK {duplicate_seq} vers {addr}", flush=True)
+                            sock.sendto(make_ack(duplicate_seq), addr)
+                            continue
                         if result.startswith("Fichier recu:"):
                             print(f"[RECV] DATA seq={seq} FIN depuis {addr}", flush=True)
                             print(f"{result} depuis {addr}", flush=True)
@@ -164,6 +176,9 @@ def main():
                         )
                 print(f"[SEND] ACK {seq} vers {addr}", flush=True)
                 sock.sendto(make_ack(seq), addr)
+                session = upload_sessions.get(addr)
+                if session is not None and session.get("completed"):
+                    close_session(upload_sessions, addr)
             except OSError as exc:
                 print(f"Erreur d'ecriture pour {addr}: {exc}", flush=True)
                 close_session(upload_sessions, addr)
