@@ -162,7 +162,7 @@ def upload_file(sock, connection, filepath, max_reprises):
     first_chunk_size = max(1, mss - 2 - len(filename_bytes))
     chunks = []
 
-    first_payload = struct.pack("!H", len(filename_bytes)) + filename_bytes
+    first_payload = protocole.build_filename_payload(filename_bytes)
     first_payload += data[:first_chunk_size]
     chunks.append(first_payload)
 
@@ -194,6 +194,73 @@ def send_data_chunks(sock, server_addr, chunks, max_reprises):
         if not send_packet_with_retry(sock, packet, server_addr, seq, max_reprises):
             return False
     return True
+
+
+def request_resume(sock, connection, filename, max_reprises):
+    server_addr = connection["addr"]
+    filename_bytes = filename.encode("utf-8")
+    packet = protocole.build_packet(
+        protocole.PROTOCOL_VERSION,
+        protocole.MSG_RESUME,
+        0,
+        0,
+        protocole.build_filename_payload(filename_bytes),
+    )
+    print(f"[SEND] RESUME {filename} vers {server_addr[0]}:{server_addr[1]}")
+    sock.sendto(packet, server_addr)
+    message = wait_for_message(sock, protocole.MSG_RESUME_ACK, max_reprises)
+    if message is None:
+        print("Impossible de recuperer le point de reprise")
+        return None
+
+    _, _, _, _, payload = message
+    try:
+        return protocole.parse_resume_ack_payload(payload)
+    except ValueError as exc:
+        print(f"RESUME_ACK invalide: {exc}")
+        return None
+
+
+def resume_file(sock, connection, filepath, max_reprises):
+    path = Path(filepath)
+    if not path.is_file():
+        print(f"Fichier introuvable: {filepath}")
+        return
+
+    server_addr = connection["addr"]
+    mss = connection["mss"]
+    data = path.read_bytes()
+
+    offset = request_resume(sock, connection, path.name, max_reprises)
+    if offset is None:
+        return
+    if offset > len(data):
+        print(
+            f"Resume impossible: le serveur annonce {offset} octets, "
+            f"mais le fichier local en contient {len(data)}"
+        )
+        return
+
+    print(
+        f"Reprise de {path.name}: offset serveur={offset} / taille locale={len(data)}"
+    )
+    remaining = data[offset:]
+    chunks = [remaining[i : i + mss] for i in range(0, len(remaining), mss)]
+
+    if chunks and not send_data_chunks(sock, server_addr, chunks, max_reprises):
+        print("Echec de la reprise du televersement")
+        return
+
+    end_seq = len(chunks) + 1
+    end_packet = protocole.build_packet(
+        protocole.PROTOCOL_VERSION, protocole.MSG_DATA, end_seq, 0
+    )
+    print(f"[SEND] FIN reprise seq={end_seq}")
+    if not send_packet_with_retry(sock, end_packet, server_addr, end_seq, max_reprises):
+        print("Echec de finalisation de la reprise")
+        return
+
+    print(f"Reprise terminee pour {path.name}")
 
 
 def main():
@@ -241,6 +308,20 @@ def main():
                 print("Aucun serveur connecte. Utilise d'abord: open IP")
                 continue
             upload_file(
+                sock,
+                server_addr,
+                cmd[1],
+                config["max_reprises"],
+            )
+
+        elif cmd[0] == "resume":
+            if len(cmd) != 2:
+                print("Usage: resume nom_de_fichier")
+                continue
+            if server_addr is None:
+                print("Aucun serveur connecte. Utilise d'abord: open IP")
+                continue
+            resume_file(
                 sock,
                 server_addr,
                 cmd[1],

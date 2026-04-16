@@ -15,6 +15,8 @@ MSG_DATA = 4
 MSG_ACK = 5
 MSG_LS = 6
 MSG_LS_RESP = 7
+MSG_RESUME = 8
+MSG_RESUME_ACK = 9
 
 
 def compute_checksum(payload):
@@ -62,3 +64,28 @@ def parse_negotiation_payload(payload):
     if len(payload) < NEGOTIATION_SIZE:
         raise ValueError("Payload de negotiation incomplet")
     return struct.unpack(NEGOTIATION_FMT, payload[:NEGOTIATION_SIZE])
+
+
+def build_filename_payload(filename_bytes):
+    return struct.pack("!H", len(filename_bytes)) + filename_bytes
+
+
+def parse_filename_payload(payload):
+    if len(payload) < 2:
+        raise ValueError("Payload de nom de fichier incomplet")
+    name_len = struct.unpack("!H", payload[:2])[0]
+    if len(payload) < 2 + name_len:
+        raise ValueError("Nom de fichier incomplet")
+    filename = payload[2 : 2 + name_len].decode("utf-8", errors="strict")
+    file_data = payload[2 + name_len :]
+    return filename, file_data
+
+
+def build_resume_ack_payload(offset):
+    return struct.pack("!Q", offset)
+
+
+def parse_resume_ack_payload(payload):
+    if len(payload) < 8:
+        raise ValueError("Payload de reprise incomplet")
+    return struct.unpack("!Q", payload[:8])[0]

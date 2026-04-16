@@ -44,11 +44,10 @@ def start_upload_session(addr, seq, payload, sessions, negotiated_mss):
     if len(payload) < 2:
         return None, "Payload initial incomplet"
 
-    name_len = struct.unpack("!H", payload[:2])[0]
-    if len(payload) < 2 + name_len:
-        return None, "Nom de fichier incomplet"
-
-    filename = payload[2 : 2 + name_len].decode("utf-8", errors="strict")
+    try:
+        filename, file_data = protocole.parse_filename_payload(payload)
+    except ValueError as exc:
+        return None, str(exc)
     if not filename or Path(filename).name != filename:
         return None, "Nom de fichier invalide"
 
@@ -56,13 +55,17 @@ def start_upload_session(addr, seq, payload, sessions, negotiated_mss):
     UPLOAD_DIR.mkdir(exist_ok=True)
     destination = UPLOAD_DIR / filename
     file_obj = destination.open("wb")
-    file_data = payload[2 + name_len :]
     if len(file_data) > negotiated_mss:
         file_obj.close()
         destination.unlink(missing_ok=True)
         return None, f"Bloc initial trop grand: {len(file_data)} > MSS {negotiated_mss}"
     file_obj.write(file_data)
-    sessions[addr] = {"expected_seq": seq + 1, "file": file_obj, "path": destination}
+    sessions[addr] = {
+        "expected_seq": seq + 1,
+        "file": file_obj,
+        "path": destination,
+        "mode": "put",
+    }
     return filename, None
 
 
@@ -95,6 +98,25 @@ def close_session(sessions, addr):
     session = sessions.pop(addr, None)
     if session is not None and not session["file"].closed:
         session["file"].close()
+
+
+def start_resume_session(addr, filename, sessions):
+    if not filename or Path(filename).name != filename:
+        return None, "Nom de fichier invalide"
+
+    close_session(sessions, addr)
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    destination = UPLOAD_DIR / filename
+    bytes_received = destination.stat().st_size if destination.exists() else 0
+    mode = "ab" if bytes_received > 0 else "wb"
+    file_obj = destination.open(mode)
+    sessions[addr] = {
+        "expected_seq": 1,
+        "file": file_obj,
+        "path": destination,
+        "mode": "resume",
+    }
+    return bytes_received, None
 
 
 def main():
@@ -168,6 +190,32 @@ def main():
             print(f"[SEND] LS_RESP vers {addr} ({len(listing)} octets)", flush=True)
             sock.sendto(rep, addr)
 
+        elif typ == protocole.MSG_RESUME:
+            print(f"[RECV] RESUME de {addr}", flush=True)
+            try:
+                filename, _ = protocole.parse_filename_payload(payload)
+            except ValueError as exc:
+                print(f"RESUME invalide de {addr}: {exc}", flush=True)
+                continue
+            bytes_received, error = start_resume_session(addr, filename, upload_sessions)
+            if error is not None:
+                print(f"RESUME refuse de {addr}: {error}", flush=True)
+                close_session(upload_sessions, addr)
+                continue
+            rep = protocole.build_packet(
+                protocole.PROTOCOL_VERSION,
+                protocole.MSG_RESUME_ACK,
+                0,
+                0,
+                protocole.build_resume_ack_payload(bytes_received),
+            )
+            print(
+                f"[SEND] RESUME_ACK vers {addr} "
+                f"(bytes_valides={bytes_received})",
+                flush=True,
+            )
+            sock.sendto(rep, addr)
+
         elif typ == protocole.MSG_DATA:
             try:
                 negotiated = peer_params.get(addr, {"mss": config["mss"], "window_size": 1})
@@ -181,7 +229,13 @@ def main():
                     sock.sendto(make_ack(seq), addr)
                     continue
 
-                if seq == 1:
+                if existing_session is None:
+                    if seq != 1:
+                        print(
+                            f"Paquet DATA ignore de {addr}: aucune session active pour seq={seq}",
+                            flush=True,
+                        )
+                        continue
                     filename, error = start_upload_session(
                         addr,
                         seq,
