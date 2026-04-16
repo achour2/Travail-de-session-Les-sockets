@@ -20,6 +20,7 @@ def load_config():
         "timeout": parser.getfloat("RESEAU", "timeout", fallback=3.0),
         "max_reprises": parser.getint("RESEAU", "max_reprises", fallback=1),
         "mss": parser.getint("PROTOCOLE", "mss", fallback=1024),
+        "window_size": parser.getint("PROTOCOLE", "fenetrage", fallback=1),
     }
 
 
@@ -66,28 +67,48 @@ def wait_for_ack(sock, expected_ack, max_reprises):
         return True
 
 
-def open_connection(sock, server_addr, max_reprises):
+def open_connection(sock, server_addr, config):
+    payload = protocole.build_negotiation_payload(
+        config["mss"],
+        config["window_size"],
+    )
     packet = protocole.build_packet(
-        protocole.PROTOCOL_VERSION, protocole.MSG_OPEN, 0, 0
+        protocole.PROTOCOL_VERSION, protocole.MSG_OPEN, 0, 0, payload
     )
 
-    for tentative in range(1, max_reprises + 1):
+    for tentative in range(1, config["max_reprises"] + 1):
         print(f"[SEND] OPEN vers {server_addr[0]}:{server_addr[1]} (tentative {tentative})")
         sock.sendto(packet, server_addr)
         message = wait_for_message(sock, protocole.MSG_OPEN_ACK, 1)
         if message is not None:
-            print("Connecte au serveur")
-            return server_addr
-        print(f"Nouvelle tentative de connexion {tentative}/{max_reprises}")
+            _, _, _, _, response_payload = message
+            try:
+                negotiated_mss, negotiated_window = protocole.parse_negotiation_payload(
+                    response_payload
+                )
+            except ValueError as exc:
+                print(f"OPEN_ACK invalide: {exc}")
+                return None
+            print(
+                "Connecte au serveur "
+                f"(mss={negotiated_mss}, window_size={negotiated_window})"
+            )
+            return {
+                "addr": server_addr,
+                "mss": negotiated_mss,
+                "window_size": negotiated_window,
+            }
+        print(f"Nouvelle tentative de connexion {tentative}/{config['max_reprises']}")
 
     print("Echec de connexion apres plusieurs tentatives")
     return None
 
 
-def list_remote_files(sock, server_addr, max_reprises):
+def list_remote_files(sock, connection, max_reprises):
     packet = protocole.build_packet(
         protocole.PROTOCOL_VERSION, protocole.MSG_LS, 0, 0
     )
+    server_addr = connection["addr"]
     print(f"[SEND] LS vers {server_addr[0]}:{server_addr[1]}")
     sock.sendto(packet, server_addr)
     message = wait_for_message(sock, protocole.MSG_LS_RESP, max_reprises)
@@ -118,11 +139,15 @@ def send_packet_with_retry(sock, packet, server_addr, seq, max_reprises):
     return False
 
 
-def upload_file(sock, server_addr, filepath, mss, max_reprises):
+def upload_file(sock, connection, filepath, max_reprises):
     path = Path(filepath)
     if not path.is_file():
         print(f"Fichier introuvable: {filepath}")
         return
+
+    server_addr = connection["addr"]
+    mss = connection["mss"]
+    window_size = connection["window_size"]
 
     filename_bytes = path.name.encode("utf-8")
     if len(filename_bytes) > 65535:
@@ -130,7 +155,10 @@ def upload_file(sock, server_addr, filepath, mss, max_reprises):
         return
 
     data = path.read_bytes()
-    print(f"Preparation du fichier {path.name}: {len(data)} octets")
+    print(
+        f"Preparation du fichier {path.name}: {len(data)} octets "
+        f"(mss negocie={mss}, window_size={window_size})"
+    )
     first_chunk_size = max(1, mss - 2 - len(filename_bytes))
     chunks = []
 
@@ -197,7 +225,7 @@ def main():
                 print("Usage: open IP")
                 continue
             addr = (cmd[1], PORT)
-            server_addr = open_connection(sock, addr, config["max_reprises"])
+            server_addr = open_connection(sock, addr, config)
 
         elif cmd[0] == "ls":
             if server_addr is None:
@@ -216,7 +244,6 @@ def main():
                 sock,
                 server_addr,
                 cmd[1],
-                config["mss"],
                 config["max_reprises"],
             )
 
@@ -225,7 +252,7 @@ def main():
                 header = protocole.build_packet(
                     protocole.PROTOCOL_VERSION, protocole.MSG_BYE, 0, 0
                 )
-                sock.sendto(header, server_addr)
+                sock.sendto(header, server_addr["addr"])
             print("Fermeture du client")
             break
         else:

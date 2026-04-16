@@ -3,6 +3,8 @@ import zlib
 
 HEADER_FMT = "!BBIIHI"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
+NEGOTIATION_FMT = "!HH"
+NEGOTIATION_SIZE = struct.calcsize(NEGOTIATION_FMT)
 PROTOCOL_VERSION = 1
 
 # Types de messages
@@ -50,3 +52,13 @@ def parse_packet(data):
 
 def is_supported_version(ver):
     return ver == PROTOCOL_VERSION
+
+
+def build_negotiation_payload(mss, window_size):
+    return struct.pack(NEGOTIATION_FMT, mss, window_size)
+
+
+def parse_negotiation_payload(payload):
+    if len(payload) < NEGOTIATION_SIZE:
+        raise ValueError("Payload de negotiation incomplet")
+    return struct.unpack(NEGOTIATION_FMT, payload[:NEGOTIATION_SIZE])

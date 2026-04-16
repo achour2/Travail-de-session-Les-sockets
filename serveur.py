@@ -19,6 +19,8 @@ def load_config():
     return {
         "fiabilite": parser.getfloat("RESEAU", "fiabilite", fallback=1.0),
         "taux_corruption": parser.getfloat("RESEAU", "taux_corruption", fallback=0.0),
+        "mss": parser.getint("PROTOCOLE", "mss", fallback=1024),
+        "window_size": parser.getint("PROTOCOLE", "fenetrage", fallback=1),
     }
 
 
@@ -38,7 +40,7 @@ def list_server_files():
     return "\n".join(files + upload_files).encode("utf-8")
 
 
-def start_upload_session(addr, seq, payload, sessions):
+def start_upload_session(addr, seq, payload, sessions, negotiated_mss):
     if len(payload) < 2:
         return None, "Payload initial incomplet"
 
@@ -54,12 +56,17 @@ def start_upload_session(addr, seq, payload, sessions):
     UPLOAD_DIR.mkdir(exist_ok=True)
     destination = UPLOAD_DIR / filename
     file_obj = destination.open("wb")
-    file_obj.write(payload[2 + name_len :])
+    file_data = payload[2 + name_len :]
+    if len(file_data) > negotiated_mss:
+        file_obj.close()
+        destination.unlink(missing_ok=True)
+        return None, f"Bloc initial trop grand: {len(file_data)} > MSS {negotiated_mss}"
+    file_obj.write(file_data)
     sessions[addr] = {"expected_seq": seq + 1, "file": file_obj, "path": destination}
     return filename, None
 
 
-def append_upload_session(addr, seq, payload, sessions):
+def append_upload_session(addr, seq, payload, sessions, negotiated_mss):
     session = sessions.get(addr)
     if session is None:
         return "Aucune session de televersement active"
@@ -75,6 +82,9 @@ def append_upload_session(addr, seq, payload, sessions):
         session["completed_seq"] = seq
         session["completed"] = True
         return f"Fichier recu: {path.name}"
+
+    if len(payload) > negotiated_mss:
+        return f"Bloc trop grand: {len(payload)} > MSS {negotiated_mss}"
 
     session["file"].write(payload)
     session["expected_seq"] += 1
@@ -104,6 +114,7 @@ def main():
 
     print(f"Serveur en ecoute sur le port {PORT}", flush=True)
     upload_sessions = {}
+    peer_params = {}
 
     while True:
         data, addr = sock.recvfrom(65535)
@@ -119,10 +130,29 @@ def main():
 
         if typ == protocole.MSG_OPEN:
             print(f"[RECV] OPEN de {addr}", flush=True)
+            try:
+                requested_mss, requested_window = protocole.parse_negotiation_payload(payload)
+            except ValueError as exc:
+                print(f"OPEN invalide de {addr}: {exc}", flush=True)
+                continue
+            negotiated_mss = max(1, min(requested_mss, config["mss"]))
+            negotiated_window = max(1, min(requested_window, config["window_size"]))
+            peer_params[addr] = {
+                "mss": negotiated_mss,
+                "window_size": negotiated_window,
+            }
             rep = protocole.build_packet(
-                protocole.PROTOCOL_VERSION, protocole.MSG_OPEN_ACK, 0, 0
+                protocole.PROTOCOL_VERSION,
+                protocole.MSG_OPEN_ACK,
+                0,
+                0,
+                protocole.build_negotiation_payload(negotiated_mss, negotiated_window),
             )
-            print(f"[SEND] OPEN_ACK vers {addr}", flush=True)
+            print(
+                f"[SEND] OPEN_ACK vers {addr} "
+                f"(mss={negotiated_mss}, window_size={negotiated_window})",
+                flush=True,
+            )
             sock.sendto(rep, addr)
 
         elif typ == protocole.MSG_LS:
@@ -140,6 +170,7 @@ def main():
 
         elif typ == protocole.MSG_DATA:
             try:
+                negotiated = peer_params.get(addr, {"mss": config["mss"], "window_size": 1})
                 existing_session = upload_sessions.get(addr)
                 if existing_session is not None and seq < existing_session["expected_seq"]:
                     print(
@@ -151,7 +182,13 @@ def main():
                     continue
 
                 if seq == 1:
-                    filename, error = start_upload_session(addr, seq, payload, upload_sessions)
+                    filename, error = start_upload_session(
+                        addr,
+                        seq,
+                        payload,
+                        upload_sessions,
+                        negotiated["mss"],
+                    )
                     if error is not None:
                         print(f"Televersement refuse de {addr}: {error}", flush=True)
                         close_session(upload_sessions, addr)
@@ -161,7 +198,13 @@ def main():
                         f"depuis {addr} ({payload_len} octets)"
                     , flush=True)
                 else:
-                    result = append_upload_session(addr, seq, payload, upload_sessions)
+                    result = append_upload_session(
+                        addr,
+                        seq,
+                        payload,
+                        upload_sessions,
+                        negotiated["mss"],
+                    )
                     if result is not None:
                         if result.startswith("Fichier recu:"):
                             print(f"[RECV] DATA seq={seq} FIN depuis {addr}", flush=True)
@@ -182,6 +225,7 @@ def main():
 
         elif typ == protocole.MSG_BYE:
             close_session(upload_sessions, addr)
+            peer_params.pop(addr, None)
             print(f"[RECV] BYE de {addr} - fermeture de session", flush=True)
 
         else:
